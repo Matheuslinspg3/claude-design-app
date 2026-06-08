@@ -22,7 +22,7 @@ function authMiddleware(req, res, next) {
   if (!APP_PASSWORD) return next(); // no password = open (dev)
   const token = req.cookies?.auth_token || req.headers["x-auth-token"];
   if (token === APP_PASSWORD) return next();
-  if (req.path === "/api/login") return next();
+  if (req.path === "/login" || req.originalUrl === "/api/login") return next();
   res.status(401).json({ error: "Não autorizado" });
 }
 
