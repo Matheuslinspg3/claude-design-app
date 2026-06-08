@@ -63,6 +63,7 @@ DESIGN RULES (always follow):
 - Mobile-responsive layout
 
 OUTPUT RULES (strict):
+- IMPORTANT: Do NOT use any tools, functions, or artifacts. Respond ONLY with raw HTML text directly in your message content.
 - ALWAYS output a single complete valid HTML document starting with <!DOCTYPE html>
 - ALL CSS must be inline in a <style> tag in <head>
 - ALL JavaScript must be inline in a <script> tag
@@ -103,6 +104,7 @@ app.post("/api/generate", async (req, res) => {
   if (currentHtml) {
     userMsg = `Here is the current HTML to modify:\n\n\`\`\`html\n${currentHtml}\n\`\`\`\n\nRequest: ${prompt}`;
   }
+  userMsg += "\n\nResponda APENAS com o c\u00f3digo HTML cru, sem usar nenhuma ferramenta, come\u00e7ando por <!DOCTYPE html>.";
   messages.push({ role: "user", content: userMsg });
 
   // Set up SSE
