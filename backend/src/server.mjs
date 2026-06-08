@@ -123,6 +123,7 @@ app.post("/api/generate", async (req, res) => {
         messages,
         stream: true,
         max_tokens: 16000,
+        tool_choice: "none",
       }),
     });
 
