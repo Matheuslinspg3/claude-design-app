@@ -1,0 +1,13 @@
+{
+  "name": "claude-design-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "cookie-parser": "^1.4.7"
+  }
+}
