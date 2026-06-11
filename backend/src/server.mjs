@@ -289,12 +289,51 @@ ITERATION RULES:
 - Keep all unrelated elements, styles, and structure intact
 - Apply changes surgically, don't rewrite from scratch unless explicitly asked`;
 
-// --- Generate endpoint (SSE streaming) ---
+// --- Planning mode system prompt ---
+const PLAN_SYSTEM_PROMPT = `Você é um designer de produto sênior atuando como assistente de PLANEJAMENTO.
+
+No modo PLANEJAMENTO você NÃO gera HTML. Seu objetivo é entender bem o pedido e produzir um plano claro.
+
+COMO AGIR:
+- Se faltar informação essencial para um bom design, faça no máximo 3 a 5 perguntas curtas e de alto valor. Pergunte só o que realmente destrava decisões e sempre sugira um padrão (ex: "Tema escuro? (sugiro sim)").
+- Se já houver contexto suficiente (ou o usuário já respondeu), produza um PLANO bem descrito em markdown: visão geral, telas/seções, componentes, layout, direção de cores e tipografia, e o que será construído.
+- Use a memória da conversa: não repita perguntas já respondidas.
+- Ao final de um plano, diga ao usuário que ele pode pedir "implementar" (ou usar /exec) para você construir.
+
+REGRAS DE SAÍDA:
+- Responda APENAS com texto markdown legível. NUNCA gere HTML, código de página, nem use ferramentas.
+- Seja focado, objetivo e acionável. Responda em português.`;
+
+// Mapeia mensagens persistidas do chat em contexto de conversa para o modelo (memoria).
+function buildMemory(chatId, limit = 16) {
+  if (!chatId) return [];
+  const rows = db
+    .prepare("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id ASC")
+    .all(chatId);
+  const recent = rows.slice(-limit);
+  const mapped = [];
+  for (const m of recent) {
+    if (m.role === "user") {
+      mapped.push({ role: "user", content: m.content });
+    } else if (m.role === "assistant") {
+      // "✓ Design updated" é placeholder de UI; vira nota curta de contexto.
+      const content = m.content === "✓ Design updated" ? "[Gerei uma versão do design conforme pedido acima.]" : m.content;
+      mapped.push({ role: "assistant", content });
+    }
+    // ignora info/error
+  }
+  return mapped;
+}
+
+// --- Generate endpoint (SSE streaming) — modos plan/exec + memoria ---
 app.post("/api/generate", async (req, res) => {
-  const { prompt, currentHtml, history, chatId } = req.body || {};
+  const { prompt, currentHtml, chatId } = req.body || {};
+  const mode = req.body?.mode === "plan" ? "plan" : "exec";
   if (!prompt) return res.status(400).json({ error: "prompt required" });
   if (chatId && !chatExists.get(chatId)) return res.status(404).json({ error: "Chat not found" });
 
+  // Memoria: pega o historico ANTES de salvar a mensagem atual.
+  const memory = buildMemory(chatId);
   if (chatId) saveMessage(chatId, "user", prompt);
 
   const providers = activeProviders();
@@ -304,25 +343,25 @@ app.post("/api/generate", async (req, res) => {
     });
   }
 
-  // Build messages array
-  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
-
-  // Add history context (last 3 iterations for context)
-  if (history && history.length > 0) {
-    const recent = history.slice(-3);
-    for (const h of recent) {
-      messages.push({ role: "user", content: h.prompt });
-      messages.push({ role: "assistant", content: h.html.slice(0, 500) + "\n[... truncated for context ...]" });
+  // Monta as mensagens conforme o modo, sempre incluindo a memoria do chat.
+  const messages = [];
+  if (mode === "plan") {
+    messages.push({ role: "system", content: PLAN_SYSTEM_PROMPT });
+    if (currentHtml) {
+      messages.push({ role: "system", content: "Existe um design atual nesta conversa que pode ser refinado. Leve-o em conta ao planejar." });
     }
+    messages.push(...memory);
+    messages.push({ role: "user", content: prompt });
+  } else {
+    messages.push({ role: "system", content: SYSTEM_PROMPT });
+    messages.push(...memory);
+    let userMsg = prompt;
+    if (currentHtml) {
+      userMsg = `Here is the current HTML to modify:\n\n\`\`\`html\n${currentHtml}\n\`\`\`\n\nRequest: ${prompt}`;
+    }
+    userMsg += "\n\nResponda APENAS com o c\u00f3digo HTML cru, sem usar nenhuma ferramenta, come\u00e7ando por <!DOCTYPE html>.";
+    messages.push({ role: "user", content: userMsg });
   }
-
-  // Current request
-  let userMsg = prompt;
-  if (currentHtml) {
-    userMsg = `Here is the current HTML to modify:\n\n\`\`\`html\n${currentHtml}\n\`\`\`\n\nRequest: ${prompt}`;
-  }
-  userMsg += "\n\nResponda APENAS com o c\u00f3digo HTML cru, sem usar nenhuma ferramenta, come\u00e7ando por <!DOCTYPE html>.";
-  messages.push({ role: "user", content: userMsg });
 
   // Set up SSE
   res.setHeader("Content-Type", "text/event-stream");
@@ -330,14 +369,12 @@ app.post("/api/generate", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
-  let completed = false;
   const failures = [];
 
   // Failover: tenta cada provedor habilitado em ordem ate um responder.
   for (let i = 0; i < providers.length; i++) {
     const provider = providers[i];
     let fullContent = "";
-    completed = false;
     try {
       const bridgeRes = await fetch(`${provider.baseUrl}/v1/chat/completions`, {
         method: "POST",
@@ -349,13 +386,12 @@ app.post("/api/generate", async (req, res) => {
           model: provider.model,
           messages,
           stream: true,
-          max_tokens: 16000,
+          max_tokens: mode === "plan" ? 4000 : 16000,
           tool_choice: "none",
         }),
       });
 
       if (!bridgeRes.ok) {
-        const errText = await bridgeRes.text();
         failures.push(`${provider.name} (${bridgeRes.status})`);
         res.write(`data: ${JSON.stringify({ info: `Provedor \"${provider.name}\" falhou (${bridgeRes.status}), tentando próximo...` })}\n\n`);
         continue; // proximo provedor
@@ -378,7 +414,6 @@ app.post("/api/generate", async (req, res) => {
           if (!line.startsWith("data: ")) continue;
           const data = line.slice(6).trim();
           if (data === "[DONE]") {
-            completed = true;
             continue;
           }
           try {
@@ -386,7 +421,7 @@ app.post("/api/generate", async (req, res) => {
             const delta = parsed.choices?.[0]?.delta?.content || "";
             if (delta) {
               fullContent += delta;
-              res.write(`data: ${JSON.stringify({ delta, partial: fullContent })}\n\n`);
+              res.write(`data: ${JSON.stringify({ delta, partial: fullContent, mode })}\n\n`);
             }
           } catch {}
         }
@@ -394,11 +429,17 @@ app.post("/api/generate", async (req, res) => {
 
       // Sucesso se recebeu conteudo (com ou sem [DONE] explicito)
       if (fullContent) {
-        if (chatId) {
-          saveMessage(chatId, "assistant", "✓ Design updated");
-          saveVersion(chatId, prompt, fullContent);
+        if (mode === "plan") {
+          // Plano: salva como mensagem do assistente (memoria), NAO cria versao de design.
+          if (chatId) saveMessage(chatId, "assistant", fullContent);
+          res.write(`data: ${JSON.stringify({ done: true, mode: "plan", text: fullContent, provider: provider.name })}\n\n`);
+        } else {
+          if (chatId) {
+            saveMessage(chatId, "assistant", "✓ Design updated");
+            saveVersion(chatId, prompt, fullContent);
+          }
+          res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: fullContent, provider: provider.name })}\n\n`);
         }
-        res.write(`data: ${JSON.stringify({ done: true, html: fullContent, provider: provider.name })}\n\n`);
         res.write("data: [DONE]\n\n");
         return res.end();
       }

@@ -32,6 +32,44 @@ function extractHtml(raw) {
   return html;
 }
 
+// Mensagem do assistente que é design vira placeholder; plano/markdown vira render legível.
+function isPlanLike(content) {
+  if (!content) return false;
+  if (content === "\u2713 Design updated") return false;
+  return true;
+}
+
+// Markdown minimalista (headings, bold, listas, code inline) seguro: escapa HTML antes.
+function renderMarkdown(src) {
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let html = esc(src || "");
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  const lines = html.split("\n");
+  let out = "";
+  let inList = false;
+  for (const line of lines) {
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    const li = line.match(/^\s*[-*]\s+(.*)$/);
+    const oli = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (h) {
+      if (inList) { out += "</ul>"; inList = false; }
+      const lvl = h[1].length;
+      out += `<h${lvl}>${h[2]}</h${lvl}>`;
+    } else if (li || oli) {
+      if (!inList) { out += "<ul>"; inList = true; }
+      out += `<li>${(li || oli)[1]}</li>`;
+    } else if (line.trim() === "") {
+      if (inList) { out += "</ul>"; inList = false; }
+    } else {
+      if (inList) { out += "</ul>"; inList = false; }
+      out += `<p>${line}</p>`;
+    }
+  }
+  if (inList) out += "</ul>";
+  return out;
+}
+
 function Sidebar({ chats, currentChatId, onNewChat, onSelectChat, onRenameChat, onDeleteChat }) {
   const [editingId, setEditingId] = useState(null);
   const [draftTitle, setDraftTitle] = useState("");
@@ -213,6 +251,9 @@ export default function Designer() {
   const [messages, setMessages] = useState([]);
   const [showVersions, setShowVersions] = useState(true);
   const [showProviders, setShowProviders] = useState(false);
+  const [mode, setMode] = useState("exec"); // "plan" | "exec"
+  const [mobilePane, setMobilePane] = useState("chat"); // "chat" | "canvas" (mobile)
+  const [showSidebar, setShowSidebar] = useState(false); // overlay sidebar (mobile)
   const messagesEnd = useRef(null);
   const abortRef = useRef(null);
   const currentChatRef = useRef(null);
@@ -332,8 +373,15 @@ export default function Designer() {
 
   async function handleSend(e) {
     e?.preventDefault();
-    const prompt = input.trim();
-    if (!prompt || generating) return;
+    let raw = input.trim();
+    if (!raw || generating) return;
+
+    // Comandos /plan e /exec sobrescrevem o modo para esta mensagem.
+    let sendMode = mode;
+    if (/^\/plan\b/i.test(raw)) { sendMode = "plan"; raw = raw.replace(/^\/plan\b\s*/i, ""); }
+    else if (/^\/exec\b/i.test(raw)) { sendMode = "exec"; raw = raw.replace(/^\/exec\b\s*/i, ""); }
+    const prompt = raw.trim();
+    if (!prompt) return;
 
     let chatId = currentChatId;
     if (!chatId) chatId = await createChat(prompt.slice(0, 48));
@@ -353,8 +401,8 @@ export default function Designer() {
         body: JSON.stringify({
           chatId,
           prompt,
+          mode: sendMode,
           currentHtml: currentHtml || null,
-          history: versions.slice(0, currentIdx + 1).map(v => ({ prompt: v.prompt, html: v.html })),
         }),
       });
 
@@ -374,6 +422,8 @@ export default function Designer() {
       const decoder = new TextDecoder();
       let buffer = "";
       let finalHtml = "";
+      let planText = "";
+      let respMode = sendMode;
       let sawDone = false;
       let streamError = null;
 
@@ -398,11 +448,14 @@ export default function Designer() {
               setMessages(m => [...m, { role: "info", content: parsed.info }]);
               continue;
             }
+            if (parsed.mode) respMode = parsed.mode;
             if (parsed.done) {
               sawDone = true;
               if (parsed.html) finalHtml = parsed.html;
+              if (parsed.text) planText = parsed.text;
             } else if (parsed.partial) {
-              finalHtml = parsed.partial;
+              if (respMode === "plan") planText = parsed.partial;
+              else finalHtml = parsed.partial;
             }
           } catch {}
         }
@@ -416,8 +469,16 @@ export default function Designer() {
       }
 
       if (!sawDone) {
-        setMessages(m => [...m, { role: "error", content: "Generation interrupted" }]);
+        setMessages(m => [...m, { role: "error", content: "Gera\u00e7\u00e3o interrompida" }]);
         setStatus("error");
+        await Promise.all([loadChats(), loadChatState(chatId)]);
+        return;
+      }
+
+      if (respMode === "plan") {
+        // Modo planejamento: mostra o plano/perguntas como mensagem, sem mexer no canvas.
+        setMessages(m => [...m, { role: "plan", content: planText, created_at: new Date().toISOString() }]);
+        setStatus("idle");
         await Promise.all([loadChats(), loadChatState(chatId)]);
         return;
       }
@@ -430,6 +491,7 @@ export default function Designer() {
         setCurrentIdx(newVersions.length - 1);
         setMessages(m => [...m, { role: "assistant", content: "✓ Design updated", created_at: new Date().toISOString() }]);
         setStatus("idle");
+        if (window.innerWidth <= 860) setMobilePane("canvas");
         await Promise.all([loadChats(), loadChatState(chatId)]);
       } else {
         setMessages(m => [...m, { role: "error", content: "Failed to generate valid HTML" }]);
@@ -464,19 +526,23 @@ export default function Designer() {
   }
 
   return (
-    <div className="app">
+    <div className={`app pane-${mobilePane} ${showSidebar ? "show-sidebar" : ""}`}>
+      {showSidebar && <div className="sidebar-backdrop" onClick={() => setShowSidebar(false)} />}
       <Sidebar
         chats={chatList}
         currentChatId={currentChatId}
-        onNewChat={() => createChat()}
-        onSelectChat={selectChat}
+        onNewChat={() => { createChat(); setShowSidebar(false); }}
+        onSelectChat={(id) => { selectChat(id); setShowSidebar(false); }}
         onRenameChat={renameChat}
         onDeleteChat={deleteChat}
       />
 
       <div className="chat-panel">
         <div className="chat-header">
-          <h1>Claude Design</h1>
+          <div className="chat-header-left">
+            <button className="menu-btn" onClick={() => setShowSidebar(true)} title="Chats" aria-label="Abrir chats">☰</button>
+            <h1>Claude Design</h1>
+          </div>
           <div className="chat-header-right">
             <button className="providers-btn" onClick={() => setShowProviders(true)} title="Provedores (base URLs + API keys)">Provedores</button>
             <div className={`status-pill status-${status}`}>
@@ -485,24 +551,37 @@ export default function Designer() {
           </div>
         </div>
         <div className="chat-messages">
-          {messages.map((m, i) => (
-            <div key={m.id || i} className={`msg msg-${m.role}`}>{m.content}</div>
-          ))}
+          {messages.map((m, i) => {
+            if (m.role === "plan" || (m.role === "assistant" && isPlanLike(m.content))) {
+              return (
+                <div key={m.id || i} className="msg msg-plan">
+                  <div className="msg-plan-tag">Plano</div>
+                  <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
+                </div>
+              );
+            }
+            return <div key={m.id || i} className={`msg msg-${m.role}`}>{m.content}</div>;
+          })}
           {generating && (
-            <div className="generating"><span className="dot" /> Generating...</div>
+            <div className="generating"><span className="dot" /> {mode === "plan" ? "Planejando..." : "Gerando..."}</div>
           )}
           {!currentChatId && messages.length === 0 && (
-            <div className="chat-empty-note">Create or send a prompt to start a persistent chat.</div>
+            <div className="chat-empty-note">Descreva um design para começar. Use o modo Planejar para refinar a ideia antes de construir.</div>
           )}
           <div ref={messagesEnd} />
         </div>
         <div className="chat-input-area">
+          <div className="mode-toggle">
+            <button className={`mode-opt ${mode === "plan" ? "active" : ""}`} onClick={() => setMode("plan")} type="button">Planejar</button>
+            <button className={`mode-opt ${mode === "exec" ? "active" : ""}`} onClick={() => setMode("exec")} type="button">Executar</button>
+            <span className="mode-hint">{mode === "plan" ? "A IA pergunta e planeja antes de construir" : "Gera o design direto do seu pedido"}</span>
+          </div>
           <form className="chat-input-wrap" onSubmit={handleSend}>
-            <textarea className="chat-input" placeholder="Describe your design..."
+            <textarea className="chat-input" placeholder={mode === "plan" ? "Descreva a ideia para planejar... (ou /exec para gerar direto)" : "Descreva seu design... (ou /plan para planejar)"}
               value={input} onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown} rows={1} disabled={generating} />
             <button className="send-btn" type="submit" disabled={generating || !input.trim()}>
-              Send
+              {mode === "plan" ? "Planejar" : "Enviar"}
             </button>
           </form>
         </div>
@@ -547,6 +626,14 @@ export default function Designer() {
         </div>
       )}
       {showProviders && <ProvidersModal onClose={() => setShowProviders(false)} />}
+
+      {/* Tab bar mobile: alterna chat / canvas */}
+      <nav className="mobile-tabs">
+        <button className={mobilePane === "chat" ? "active" : ""} onClick={() => setMobilePane("chat")}>Chat</button>
+        <button className={mobilePane === "canvas" ? "active" : ""} onClick={() => setMobilePane("canvas")}>
+          Canvas{versions.length > 0 ? ` · v${currentIdx + 1}` : ""}
+        </button>
+      </nav>
     </div>
   );
 }
