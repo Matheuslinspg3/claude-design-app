@@ -174,3 +174,81 @@ body { background: var(--bg-0); color: var(--text); overflow: hidden; height: 10
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 3px; }
+
+/* --- Header right + Providers button --- */
+.chat-header-right { display: flex; align-items: center; gap: 10px; }
+.providers-btn {
+  padding: 6px 12px; background: var(--bg-2); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 12px; cursor: pointer; transition: all 150ms ease;
+}
+.providers-btn:hover { color: var(--text); border-color: var(--accent); }
+
+/* --- Info message (failover notice) --- */
+.msg-info {
+  align-self: center; background: var(--bg-2); color: var(--text-muted);
+  font-size: 12px; font-style: italic; border: 1px dashed var(--border);
+}
+
+/* --- Modal --- */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+  backdrop-filter: blur(4px);
+}
+.modal {
+  width: 640px; max-width: 92vw; max-height: 86vh; overflow-y: auto;
+  background: var(--bg-1); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+}
+.modal-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
+.modal-header h2 { font-size: 18px; font-weight: 600; }
+.modal-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; max-width: 460px; }
+.modal-close {
+  background: none; border: none; color: var(--text-dim); font-size: 24px;
+  cursor: pointer; line-height: 1; padding: 0 4px;
+}
+.modal-close:hover { color: var(--text); }
+
+/* --- Provider list --- */
+.provider-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; }
+.provider-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.provider-item.disabled { opacity: 0.5; }
+.provider-order { display: flex; flex-direction: column; gap: 2px; }
+.provider-order button {
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-dim);
+  width: 22px; height: 18px; border-radius: 4px; cursor: pointer; font-size: 10px;
+}
+.provider-order button:disabled { opacity: 0.3; cursor: default; }
+.provider-info { flex: 1; min-width: 0; }
+.provider-name { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.provider-model { font-size: 11px; color: var(--text-muted); font-weight: 400; }
+.provider-url { font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.provider-key { font-size: 11px; color: var(--text-muted); font-family: 'Geist Mono', monospace; }
+.provider-actions { display: flex; gap: 6px; }
+.provider-actions button {
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-dim);
+  padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 12px;
+}
+.provider-actions button:hover { color: var(--text); border-color: var(--accent); }
+.provider-actions button.danger:hover { color: var(--error); border-color: var(--error); }
+.provider-empty { font-size: 13px; color: var(--text-muted); text-align: center; padding: 16px; }
+
+/* --- Provider form --- */
+.provider-form { display: flex; flex-direction: column; gap: 8px; }
+.provider-form input {
+  background: var(--bg-2); border: 1px solid var(--border); color: var(--text);
+  padding: 10px 12px; border-radius: var(--radius-sm); font-size: 13px; font-family: inherit;
+}
+.provider-form input:focus { outline: none; border-color: var(--accent); }
+.provider-form button[type="submit"] {
+  padding: 10px; background: var(--accent); color: white; border: none;
+  border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; cursor: pointer;
+}
+.provider-form button[type="submit"]:hover { background: var(--accent-hover); }
+.provider-form button:disabled { opacity: 0.6; cursor: default; }
+.provider-note { margin-top: 12px; font-size: 12px; color: var(--text-dim); word-break: break-word; }

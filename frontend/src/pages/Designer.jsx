@@ -101,6 +101,108 @@ function Sidebar({ chats, currentChatId, onNewChat, onSelectChat, onRenameChat, 
   );
 }
 
+const emptyDraft = { name: "", base_url: "", api_key: "", model: "claude-opus-4-7" };
+
+function ProvidersModal({ onClose }) {
+  const [providers, setProviders] = useState([]);
+  const [draft, setDraft] = useState(emptyDraft);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+
+  const load = useCallback(async () => {
+    const data = await api("/api/providers");
+    setProviders(data.providers || []);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function addProvider(e) {
+    e?.preventDefault();
+    if (!draft.base_url.trim() || !draft.api_key.trim()) { setNote("Base URL e API key são obrigatórias."); return; }
+    setBusy(true); setNote("");
+    try {
+      await api("/api/providers", { method: "POST", body: JSON.stringify(draft) });
+      setDraft(emptyDraft);
+      await load();
+    } catch (err) { setNote(err.message); }
+    finally { setBusy(false); }
+  }
+
+  async function toggleProvider(p) {
+    await api(`/api/providers/${p.id}`, { method: "PUT", body: JSON.stringify({ enabled: !p.enabled }) });
+    await load();
+  }
+
+  async function removeProvider(id) {
+    await api(`/api/providers/${id}`, { method: "DELETE" });
+    await load();
+  }
+
+  async function move(p, dir) {
+    const idx = providers.findIndex(x => x.id === p.id);
+    const swapWith = providers[idx + dir];
+    if (!swapWith) return;
+    await api(`/api/providers/${p.id}`, { method: "PUT", body: JSON.stringify({ sort_order: swapWith.sort_order }) });
+    await api(`/api/providers/${swapWith.id}`, { method: "PUT", body: JSON.stringify({ sort_order: p.sort_order }) });
+    await load();
+  }
+
+  async function testProvider(p) {
+    setNote(`Testando "${p.name}"...`);
+    const r = await api("/api/providers/test", { method: "POST", body: JSON.stringify({ id: p.id }) });
+    setNote(`"${p.name}": ${r.ok ? "OK ✓" : `falhou (${r.status})`} ${r.ok ? "" : r.body}`);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <h2>Provedores</h2>
+            <p className="modal-sub">Várias base URLs + API keys. O app tenta na ordem até uma responder (failover).</p>
+          </div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+
+        <div className="provider-list">
+          {providers.map((p, i) => (
+            <div key={p.id} className={`provider-item ${p.enabled ? "" : "disabled"}`}>
+              <div className="provider-order">
+                <button onClick={() => move(p, -1)} disabled={i === 0}>↑</button>
+                <button onClick={() => move(p, 1)} disabled={i === providers.length - 1}>↓</button>
+              </div>
+              <div className="provider-info">
+                <div className="provider-name">{p.name} <span className="provider-model">{p.model}</span></div>
+                <div className="provider-url">{p.base_url}</div>
+                <div className="provider-key">{p.api_key_masked}</div>
+              </div>
+              <div className="provider-actions">
+                <button onClick={() => testProvider(p)}>Testar</button>
+                <button onClick={() => toggleProvider(p)}>{p.enabled ? "On" : "Off"}</button>
+                <button className="danger" onClick={() => removeProvider(p.id)}>×</button>
+              </div>
+            </div>
+          ))}
+          {providers.length === 0 && <div className="provider-empty">Nenhum provedor ainda. Adicione abaixo.</div>}
+        </div>
+
+        <form className="provider-form" onSubmit={addProvider}>
+          <input placeholder="Nome (ex: right.codes)" value={draft.name}
+            onChange={e => setDraft({ ...draft, name: e.target.value })} />
+          <input placeholder="Base URL (ex: https://right.codes/claude)" value={draft.base_url}
+            onChange={e => setDraft({ ...draft, base_url: e.target.value })} />
+          <input placeholder="API key" type="password" value={draft.api_key}
+            onChange={e => setDraft({ ...draft, api_key: e.target.value })} />
+          <input placeholder="Modelo (ex: claude-opus-4-7)" value={draft.model}
+            onChange={e => setDraft({ ...draft, model: e.target.value })} />
+          <button type="submit" disabled={busy}>{busy ? "Adicionando..." : "Adicionar provedor"}</button>
+        </form>
+        {note && <div className="provider-note">{note}</div>}
+      </div>
+    </div>
+  );
+}
+
 export default function Designer() {
   const [chatList, setChatList] = useState([]);
   const [currentChatId, setCurrentChatId] = useState(null);
@@ -110,6 +212,7 @@ export default function Designer() {
   const [status, setStatus] = useState("idle");
   const [messages, setMessages] = useState([]);
   const [showVersions, setShowVersions] = useState(true);
+  const [showProviders, setShowProviders] = useState(false);
   const messagesEnd = useRef(null);
   const abortRef = useRef(null);
   const currentChatRef = useRef(null);
@@ -291,6 +394,10 @@ export default function Designer() {
               streamError = parsed.error;
               continue;
             }
+            if (parsed.info) {
+              setMessages(m => [...m, { role: "info", content: parsed.info }]);
+              continue;
+            }
             if (parsed.done) {
               sawDone = true;
               if (parsed.html) finalHtml = parsed.html;
@@ -370,8 +477,11 @@ export default function Designer() {
       <div className="chat-panel">
         <div className="chat-header">
           <h1>Claude Design</h1>
-          <div className={`status-pill status-${status}`}>
-            <span className="status-dot" /> {status}
+          <div className="chat-header-right">
+            <button className="providers-btn" onClick={() => setShowProviders(true)} title="Provedores (base URLs + API keys)">Provedores</button>
+            <div className={`status-pill status-${status}`}>
+              <span className="status-dot" /> {status}
+            </div>
           </div>
         </div>
         <div className="chat-messages">
@@ -436,6 +546,7 @@ export default function Designer() {
           </div>
         </div>
       )}
+      {showProviders && <ProvidersModal onClose={() => setShowProviders(false)} />}
     </div>
   );
 }

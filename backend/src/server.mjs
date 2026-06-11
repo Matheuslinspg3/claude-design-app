@@ -26,6 +26,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
   CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, created_at TEXT);
   CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, prompt TEXT, html TEXT, created_at TEXT);
+  CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT, base_url TEXT, api_key TEXT, model TEXT, sort_order INTEGER, enabled INTEGER DEFAULT 1, created_at TEXT);
 `);
 
 const chatExists = db.prepare("SELECT id FROM chats WHERE id = ?");
@@ -35,6 +36,51 @@ const insertVersion = db.prepare("INSERT INTO versions (chat_id, prompt, html, c
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+// --- Provider helpers (multi base URL + key, com failover) ---
+function maskKey(k) {
+  if (!k) return "";
+  if (k.length <= 8) return "\u2022\u2022\u2022\u2022";
+  return k.slice(0, 4) + "\u2026" + k.slice(-4);
+}
+
+function listProvidersRaw() {
+  return db.prepare("SELECT * FROM providers ORDER BY sort_order ASC, created_at ASC").all();
+}
+
+function listProvidersSafe() {
+  return listProvidersRaw().map((p) => ({
+    id: p.id,
+    name: p.name,
+    base_url: p.base_url,
+    model: p.model,
+    sort_order: p.sort_order,
+    enabled: !!p.enabled,
+    api_key_masked: maskKey(p.api_key),
+  }));
+}
+
+// Provedores ativos na ordem de tentativa. Inclui o do env como fallback final.
+function activeProviders() {
+  const list = listProvidersRaw()
+    .filter((p) => p.enabled)
+    .map((p) => ({
+      name: p.name || "provider",
+      baseUrl: (p.base_url || "").replace(/\/+$/, ""),
+      apiKey: p.api_key,
+      model: p.model || BRIDGE_MODEL,
+    }))
+    .filter((p) => p.baseUrl && p.apiKey);
+  if (BRIDGE_URL && BRIDGE_TOKEN) {
+    list.push({
+      name: "env",
+      baseUrl: BRIDGE_URL.replace(/\/+$/, ""),
+      apiKey: BRIDGE_TOKEN,
+      model: BRIDGE_MODEL,
+    });
+  }
+  return list;
 }
 
 function requireChat(req, res, next) {
@@ -151,6 +197,70 @@ app.post("/api/chats/:id/versions", requireChat, (req, res) => {
   res.status(201).json(version);
 });
 
+// --- Providers API (multiplas base URL + api key, com failover) ---
+app.get("/api/providers", (req, res) => {
+  res.json({ providers: listProvidersSafe() });
+});
+
+app.post("/api/providers", (req, res) => {
+  const name = String(req.body?.name || "").trim().slice(0, 80) || "Provider";
+  const base_url = String(req.body?.base_url || "").trim();
+  const api_key = String(req.body?.api_key || "").trim();
+  const model = String(req.body?.model || "").trim() || BRIDGE_MODEL;
+  if (!base_url || !api_key) return res.status(400).json({ error: "base_url and api_key required" });
+  const id = randomUUID();
+  const maxOrder = db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM providers").get().m;
+  db.prepare(
+    "INSERT INTO providers (id, name, base_url, api_key, model, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)"
+  ).run(id, name, base_url, api_key, model, maxOrder + 1, nowIso());
+  res.status(201).json({ id });
+});
+
+app.put("/api/providers/:id", (req, res) => {
+  const existing = db.prepare("SELECT * FROM providers WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Provider not found" });
+  const name = req.body?.name !== undefined ? String(req.body.name).trim().slice(0, 80) : existing.name;
+  const base_url = req.body?.base_url !== undefined ? String(req.body.base_url).trim() : existing.base_url;
+  const model = req.body?.model !== undefined ? (String(req.body.model).trim() || BRIDGE_MODEL) : existing.model;
+  const enabled = req.body?.enabled !== undefined ? (req.body.enabled ? 1 : 0) : existing.enabled;
+  const sort_order = req.body?.sort_order !== undefined ? parseInt(req.body.sort_order, 10) : existing.sort_order;
+  // api_key so atualiza se vier preenchida (evita sobrescrever com mascara)
+  const api_key = req.body?.api_key ? String(req.body.api_key).trim() : existing.api_key;
+  db.prepare(
+    "UPDATE providers SET name = ?, base_url = ?, api_key = ?, model = ?, enabled = ?, sort_order = ? WHERE id = ?"
+  ).run(name, base_url, api_key, model, enabled, sort_order, req.params.id);
+  res.json({ ok: true });
+});
+
+app.delete("/api/providers/:id", (req, res) => {
+  db.prepare("DELETE FROM providers WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Testa um provedor especifico (ou um payload ad-hoc) sem gerar design.
+app.post("/api/providers/test", async (req, res) => {
+  let base_url = String(req.body?.base_url || "").trim();
+  let api_key = String(req.body?.api_key || "").trim();
+  let model = String(req.body?.model || "").trim() || BRIDGE_MODEL;
+  if (req.body?.id) {
+    const p = db.prepare("SELECT * FROM providers WHERE id = ?").get(req.body.id);
+    if (!p) return res.status(404).json({ error: "Provider not found" });
+    base_url = p.base_url; api_key = p.api_key; model = p.model || BRIDGE_MODEL;
+  }
+  if (!base_url || !api_key) return res.status(400).json({ error: "base_url and api_key required" });
+  try {
+    const r = await fetch(`${base_url.replace(/\/+$/, "")}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${api_key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
+    });
+    const text = await r.text();
+    return res.json({ ok: r.ok, status: r.status, body: text.slice(0, 200) });
+  } catch (err) {
+    return res.json({ ok: false, status: 0, body: err.message });
+  }
+});
+
 // --- System prompt for the design generator ---
 const SYSTEM_PROMPT = `You are an expert UI designer and frontend developer. You generate beautiful, production-quality HTML interfaces.
 
@@ -187,9 +297,10 @@ app.post("/api/generate", async (req, res) => {
 
   if (chatId) saveMessage(chatId, "user", prompt);
 
-  if (!BRIDGE_URL || !BRIDGE_TOKEN) {
+  const providers = activeProviders();
+  if (providers.length === 0) {
     return res.status(503).json({
-      error: "Bridge not configured. Set BRIDGE_URL and BRIDGE_TOKEN env vars.",
+      error: "Nenhum provedor configurado. Adicione base URL + API key na aba Provedores (ou configure BRIDGE_URL/BRIDGE_TOKEN).",
     });
   }
 
@@ -220,81 +331,89 @@ app.post("/api/generate", async (req, res) => {
   res.flushHeaders();
 
   let completed = false;
+  const failures = [];
 
-  try {
-    const bridgeRes = await fetch(`${BRIDGE_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${BRIDGE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: BRIDGE_MODEL,
-        messages,
-        stream: true,
-        max_tokens: 16000,
-        tool_choice: "none",
-      }),
-    });
-
-    if (!bridgeRes.ok) {
-      const errText = await bridgeRes.text();
-      res.write(`data: ${JSON.stringify({ error: `Bridge error ${bridgeRes.status}: ${errText.slice(0, 200)}` })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      return res.end();
-    }
-
-    // Stream SSE from bridge to client
-    const reader = bridgeRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+  // Failover: tenta cada provedor habilitado em ordem ate um responder.
+  for (let i = 0; i < providers.length; i++) {
+    const provider = providers[i];
     let fullContent = "";
+    completed = false;
+    try {
+      const bridgeRes = await fetch(`${provider.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${provider.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: provider.model,
+          messages,
+          stream: true,
+          max_tokens: 16000,
+          tool_choice: "none",
+        }),
+      });
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      if (!bridgeRes.ok) {
+        const errText = await bridgeRes.text();
+        failures.push(`${provider.name} (${bridgeRes.status})`);
+        res.write(`data: ${JSON.stringify({ info: `Provedor \"${provider.name}\" falhou (${bridgeRes.status}), tentando próximo...` })}\n\n`);
+        continue; // proximo provedor
+      }
 
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+      // Stream SSE do provedor para o cliente
+      const reader = bridgeRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const data = line.slice(6).trim();
-        if (data === "[DONE]") {
-          completed = true;
-          if (chatId && fullContent) {
-            saveMessage(chatId, "assistant", "✓ Design updated");
-            saveVersion(chatId, prompt, fullContent);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6).trim();
+          if (data === "[DONE]") {
+            completed = true;
+            continue;
           }
-          res.write(`data: ${JSON.stringify({ done: true, html: fullContent })}\n\n`);
-          res.write("data: [DONE]\n\n");
-          continue;
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta?.content || "";
+            if (delta) {
+              fullContent += delta;
+              res.write(`data: ${JSON.stringify({ delta, partial: fullContent })}\n\n`);
+            }
+          } catch {}
         }
-        try {
-          const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta?.content || "";
-          if (delta) {
-            fullContent += delta;
-            res.write(`data: ${JSON.stringify({ delta, partial: fullContent })}\n\n`);
-          }
-        } catch {}
       }
-    }
 
-    // If bridge didn't send [DONE], send it ourselves
-    if (!completed) {
-      if (chatId && fullContent) {
-        saveMessage(chatId, "assistant", "✓ Design updated");
-        saveVersion(chatId, prompt, fullContent);
+      // Sucesso se recebeu conteudo (com ou sem [DONE] explicito)
+      if (fullContent) {
+        if (chatId) {
+          saveMessage(chatId, "assistant", "✓ Design updated");
+          saveVersion(chatId, prompt, fullContent);
+        }
+        res.write(`data: ${JSON.stringify({ done: true, html: fullContent, provider: provider.name })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
       }
-      res.write(`data: ${JSON.stringify({ done: true, html: fullContent })}\n\n`);
-      res.write("data: [DONE]\n\n");
+      // Sem conteudo: trata como falha e tenta o proximo
+      failures.push(`${provider.name} (vazio)`);
+    } catch (err) {
+      failures.push(`${provider.name} (${err.message})`);
+      res.write(`data: ${JSON.stringify({ info: `Provedor \"${provider.name}\" erro de conexão, tentando próximo...` })}\n\n`);
+      continue;
     }
-  } catch (err) {
-    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-    res.write("data: [DONE]\n\n");
   }
+
+  // Todos os provedores falharam
+  res.write(`data: ${JSON.stringify({ error: `Todos os provedores falharam: ${failures.join(", ")}` })}\n\n`);
+  res.write("data: [DONE]\n\n");
   res.end();
 });
 
