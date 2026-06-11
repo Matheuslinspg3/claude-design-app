@@ -1,5 +1,8 @@
 import express from "express";
 import cookieParser from "cookie-parser";
+import Database from "better-sqlite3";
+import { randomUUID } from "crypto";
+import { existsSync, mkdirSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
@@ -13,6 +16,48 @@ const {
   BRIDGE_TOKEN,
   BRIDGE_MODEL = "claude-opus-4-7",
 } = process.env;
+
+const dataDir = existsSync("/data") ? "/data" : "/tmp";
+mkdirSync(dataDir, { recursive: true });
+const dbPath = join(dataDir, "claude-design.db");
+const db = new Database(dbPath);
+db.pragma("journal_mode = WAL");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
+  CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, created_at TEXT);
+  CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, prompt TEXT, html TEXT, created_at TEXT);
+`);
+
+const chatExists = db.prepare("SELECT id FROM chats WHERE id = ?");
+const touchChat = db.prepare("UPDATE chats SET updated_at = ? WHERE id = ?");
+const insertMessage = db.prepare("INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)");
+const insertVersion = db.prepare("INSERT INTO versions (chat_id, prompt, html, created_at) VALUES (?, ?, ?, ?)");
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function requireChat(req, res, next) {
+  const { id } = req.params;
+  if (!chatExists.get(id)) return res.status(404).json({ error: "Chat not found" });
+  next();
+}
+
+function saveMessage(chatId, role, content) {
+  if (!chatId || !chatExists.get(chatId)) return null;
+  const createdAt = nowIso();
+  const info = insertMessage.run(chatId, role, content, createdAt);
+  touchChat.run(createdAt, chatId);
+  return { id: info.lastInsertRowid, chat_id: chatId, role, content, created_at: createdAt };
+}
+
+function saveVersion(chatId, prompt, html) {
+  if (!chatId || !chatExists.get(chatId)) return null;
+  const createdAt = nowIso();
+  const info = insertVersion.run(chatId, prompt, html, createdAt);
+  touchChat.run(createdAt, chatId);
+  return { id: info.lastInsertRowid, chat_id: chatId, prompt, html, created_at: createdAt };
+}
 
 app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
@@ -48,6 +93,64 @@ app.get("/api/auth", (req, res) => {
   res.json({ authenticated: true });
 });
 
+// --- Chat persistence API ---
+app.get("/api/chats", (req, res) => {
+  const chats = db.prepare("SELECT id, title, updated_at FROM chats ORDER BY updated_at DESC").all();
+  res.json({ chats });
+});
+
+app.post("/api/chats", (req, res) => {
+  const title = String(req.body?.title || "New Chat").trim().slice(0, 120) || "New Chat";
+  const id = randomUUID();
+  const createdAt = nowIso();
+  db.prepare("INSERT INTO chats (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)").run(id, title, createdAt, createdAt);
+  res.status(201).json({ id, title, created_at: createdAt, updated_at: createdAt });
+});
+
+app.put("/api/chats/:id", requireChat, (req, res) => {
+  const title = String(req.body?.title || "").trim().slice(0, 120);
+  if (!title) return res.status(400).json({ error: "title required" });
+  const updatedAt = nowIso();
+  db.prepare("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?").run(title, updatedAt, req.params.id);
+  res.json({ id: req.params.id, title, updated_at: updatedAt });
+});
+
+app.delete("/api/chats/:id", requireChat, (req, res) => {
+  const remove = db.transaction((id) => {
+    db.prepare("DELETE FROM messages WHERE chat_id = ?").run(id);
+    db.prepare("DELETE FROM versions WHERE chat_id = ?").run(id);
+    db.prepare("DELETE FROM chats WHERE id = ?").run(id);
+  });
+  remove(req.params.id);
+  res.json({ ok: true });
+});
+
+app.get("/api/chats/:id/messages", requireChat, (req, res) => {
+  const messages = db.prepare("SELECT id, role, content, created_at FROM messages WHERE chat_id = ? ORDER BY id ASC").all(req.params.id);
+  res.json({ messages });
+});
+
+app.get("/api/chats/:id/versions", requireChat, (req, res) => {
+  const versions = db.prepare("SELECT id, prompt, html, created_at FROM versions WHERE chat_id = ? ORDER BY id ASC").all(req.params.id);
+  res.json({ versions });
+});
+
+app.post("/api/chats/:id/messages", requireChat, (req, res) => {
+  const role = String(req.body?.role || "").trim();
+  const content = String(req.body?.content || "").trim();
+  if (!role || !content) return res.status(400).json({ error: "role and content required" });
+  const message = saveMessage(req.params.id, role, content);
+  res.status(201).json(message);
+});
+
+app.post("/api/chats/:id/versions", requireChat, (req, res) => {
+  const prompt = String(req.body?.prompt || "").trim();
+  const html = String(req.body?.html || "");
+  if (!prompt || !html) return res.status(400).json({ error: "prompt and html required" });
+  const version = saveVersion(req.params.id, prompt, html);
+  res.status(201).json(version);
+});
+
 // --- System prompt for the design generator ---
 const SYSTEM_PROMPT = `You are an expert UI designer and frontend developer. You generate beautiful, production-quality HTML interfaces.
 
@@ -78,8 +181,11 @@ ITERATION RULES:
 
 // --- Generate endpoint (SSE streaming) ---
 app.post("/api/generate", async (req, res) => {
-  const { prompt, currentHtml, history } = req.body || {};
+  const { prompt, currentHtml, history, chatId } = req.body || {};
   if (!prompt) return res.status(400).json({ error: "prompt required" });
+  if (chatId && !chatExists.get(chatId)) return res.status(404).json({ error: "Chat not found" });
+
+  if (chatId) saveMessage(chatId, "user", prompt);
 
   if (!BRIDGE_URL || !BRIDGE_TOKEN) {
     return res.status(503).json({
@@ -112,6 +218,8 @@ app.post("/api/generate", async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
+
+  let completed = false;
 
   try {
     const bridgeRes = await fetch(`${BRIDGE_URL}/v1/chat/completions`, {
@@ -154,6 +262,11 @@ app.post("/api/generate", async (req, res) => {
         if (!line.startsWith("data: ")) continue;
         const data = line.slice(6).trim();
         if (data === "[DONE]") {
+          completed = true;
+          if (chatId && fullContent) {
+            saveMessage(chatId, "assistant", "✓ Design updated");
+            saveVersion(chatId, prompt, fullContent);
+          }
           res.write(`data: ${JSON.stringify({ done: true, html: fullContent })}\n\n`);
           res.write("data: [DONE]\n\n");
           continue;
@@ -170,7 +283,11 @@ app.post("/api/generate", async (req, res) => {
     }
 
     // If bridge didn't send [DONE], send it ourselves
-    if (!fullContent.includes("[DONE]")) {
+    if (!completed) {
+      if (chatId && fullContent) {
+        saveMessage(chatId, "assistant", "✓ Design updated");
+        saveVersion(chatId, prompt, fullContent);
+      }
       res.write(`data: ${JSON.stringify({ done: true, html: fullContent })}\n\n`);
       res.write("data: [DONE]\n\n");
     }
@@ -191,4 +308,5 @@ app.get("*", (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Claude Design App running on port ${PORT}`);
   console.log(`Bridge: ${BRIDGE_URL || "NOT SET"}`);
+  console.log(`DB: ${dbPath}`);
 });

@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
-    "cookie-parser": "^1.4.7"
+    "cookie-parser": "^1.4.7",
+    "better-sqlite3": "^11.8.1"
   }
 }
