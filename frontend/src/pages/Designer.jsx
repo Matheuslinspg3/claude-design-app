@@ -453,7 +453,12 @@ export default function Designer() {
               sawDone = true;
               if (parsed.html) finalHtml = parsed.html;
               if (parsed.text) planText = parsed.text;
+            } else if (parsed.delta) {
+              // Acumula o delta incremental (backend envia só o trecho novo).
+              if (respMode === "plan") { planText += parsed.delta; }
+              else { finalHtml += parsed.delta; }
             } else if (parsed.partial) {
+              // Compat: caso o backend ainda mande partial completo.
               if (respMode === "plan") planText = parsed.partial;
               else finalHtml = parsed.partial;
             }

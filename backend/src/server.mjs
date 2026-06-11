@@ -421,7 +421,8 @@ app.post("/api/generate", async (req, res) => {
             const delta = parsed.choices?.[0]?.delta?.content || "";
             if (delta) {
               fullContent += delta;
-              res.write(`data: ${JSON.stringify({ delta, partial: fullContent, mode })}\n\n`);
+              // Envia apenas o delta incremental (o front acumula). Evita crescimento O(n^2) do SSE.
+              res.write(`data: ${JSON.stringify({ delta, mode })}\n\n`);
             }
           } catch {}
         }
