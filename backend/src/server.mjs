@@ -1,8 +1,8 @@
 import express from "express";
 import cookieParser from "cookie-parser";
-import Database from "better-sqlite3";
+import initSqlJs from "sql.js";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
@@ -17,92 +17,86 @@ const {
   BRIDGE_MODEL = "claude-opus-4-7",
 } = process.env;
 
+// --- Database setup (sql.js — pure JS, no native deps) ---
 const dataDir = existsSync("/data") ? "/data" : "/tmp";
 mkdirSync(dataDir, { recursive: true });
 const dbPath = join(dataDir, "claude-design.db");
-const db = new Database(dbPath);
-db.pragma("journal_mode = WAL");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
-  CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, created_at TEXT);
-  CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, prompt TEXT, html TEXT, created_at TEXT);
-  CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT, base_url TEXT, api_key TEXT, model TEXT, sort_order INTEGER, enabled INTEGER DEFAULT 1, created_at TEXT);
-`);
 
-const chatExists = db.prepare("SELECT id FROM chats WHERE id = ?");
-const touchChat = db.prepare("UPDATE chats SET updated_at = ? WHERE id = ?");
-const insertMessage = db.prepare("INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)");
-const insertVersion = db.prepare("INSERT INTO versions (chat_id, prompt, html, created_at) VALUES (?, ?, ?, ?)");
+let db;
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-// --- Provider helpers (multi base URL + key, com failover) ---
-function maskKey(k) {
-  if (!k) return "";
-  if (k.length <= 8) return "\u2022\u2022\u2022\u2022";
-  return k.slice(0, 4) + "\u2026" + k.slice(-4);
-}
-
-function listProvidersRaw() {
-  return db.prepare("SELECT * FROM providers ORDER BY sort_order ASC, created_at ASC").all();
-}
-
-function listProvidersSafe() {
-  return listProvidersRaw().map((p) => ({
-    id: p.id,
-    name: p.name,
-    base_url: p.base_url,
-    model: p.model,
-    sort_order: p.sort_order,
-    enabled: !!p.enabled,
-    api_key_masked: maskKey(p.api_key),
-  }));
-}
-
-// Provedores ativos na ordem de tentativa. Inclui o do env como fallback final.
-function activeProviders() {
-  const list = listProvidersRaw()
-    .filter((p) => p.enabled)
-    .map((p) => ({
-      name: p.name || "provider",
-      baseUrl: (p.base_url || "").replace(/\/+$/, ""),
-      apiKey: p.api_key,
-      model: p.model || BRIDGE_MODEL,
-    }))
-    .filter((p) => p.baseUrl && p.apiKey);
-  if (BRIDGE_URL && BRIDGE_TOKEN) {
-    list.push({
-      name: "env",
-      baseUrl: BRIDGE_URL.replace(/\/+$/, ""),
-      apiKey: BRIDGE_TOKEN,
-      model: BRIDGE_MODEL,
-    });
+async function initDb() {
+  const SQL = await initSqlJs();
+  if (existsSync(dbPath)) {
+    const buffer = readFileSync(dbPath);
+    db = new SQL.Database(buffer);
+  } else {
+    db = new SQL.Database();
   }
-  return list;
+  db.run(`
+    CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, prompt TEXT, html TEXT, created_at TEXT);
+  `);
+  saveDb();
 }
 
-function requireChat(req, res, next) {
-  const { id } = req.params;
-  if (!chatExists.get(id)) return res.status(404).json({ error: "Chat not found" });
-  next();
+function saveDb() {
+  try {
+    const data = db.export();
+    writeFileSync(dbPath, Buffer.from(data));
+  } catch (e) {
+    console.error("[db] save error:", e.message);
+  }
+}
+
+// Debounced save (avoid writing on every single operation)
+let saveTimer = null;
+function debouncedSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveDb, 500);
+}
+
+function nowIso() { return new Date().toISOString(); }
+
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
+}
+
+function queryOne(sql, params = []) {
+  const rows = queryAll(sql, params);
+  return rows[0] || null;
+}
+
+function run(sql, params = []) {
+  db.run(sql, params);
+  debouncedSave();
+}
+
+function chatExists(id) {
+  return !!queryOne("SELECT id FROM chats WHERE id = ?", [id]);
 }
 
 function saveMessage(chatId, role, content) {
-  if (!chatId || !chatExists.get(chatId)) return null;
+  if (!chatId || !chatExists(chatId)) return null;
   const createdAt = nowIso();
-  const info = insertMessage.run(chatId, role, content, createdAt);
-  touchChat.run(createdAt, chatId);
-  return { id: info.lastInsertRowid, chat_id: chatId, role, content, created_at: createdAt };
+  run("INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)", [chatId, role, content, createdAt]);
+  run("UPDATE chats SET updated_at = ? WHERE id = ?", [createdAt, chatId]);
+  const row = queryOne("SELECT last_insert_rowid() as id");
+  return { id: row?.id, chat_id: chatId, role, content, created_at: createdAt };
 }
 
 function saveVersion(chatId, prompt, html) {
-  if (!chatId || !chatExists.get(chatId)) return null;
+  if (!chatId || !chatExists(chatId)) return null;
   const createdAt = nowIso();
-  const info = insertVersion.run(chatId, prompt, html, createdAt);
-  touchChat.run(createdAt, chatId);
-  return { id: info.lastInsertRowid, chat_id: chatId, prompt, html, created_at: createdAt };
+  run("INSERT INTO versions (chat_id, prompt, html, created_at) VALUES (?, ?, ?, ?)", [chatId, prompt, html, createdAt]);
+  run("UPDATE chats SET updated_at = ? WHERE id = ?", [createdAt, chatId]);
+  const row = queryOne("SELECT last_insert_rowid() as id");
+  return { id: row?.id, chat_id: chatId, prompt, html, created_at: createdAt };
 }
 
 app.use(express.json({ limit: "2mb" }));
@@ -110,7 +104,7 @@ app.use(cookieParser());
 
 // --- Auth middleware ---
 function authMiddleware(req, res, next) {
-  if (!APP_PASSWORD) return next(); // no password = open (dev)
+  if (!APP_PASSWORD) return next();
   const token = req.cookies?.auth_token || req.headers["x-auth-token"];
   if (token === APP_PASSWORD) return next();
   if (req.path === "/login" || req.originalUrl === "/api/login") return next();
@@ -134,14 +128,11 @@ app.post("/api/login", (req, res) => {
   res.status(401).json({ error: "Senha incorreta" });
 });
 
-// --- Check auth ---
-app.get("/api/auth", (req, res) => {
-  res.json({ authenticated: true });
-});
+app.get("/api/auth", (req, res) => { res.json({ authenticated: true }); });
 
-// --- Chat persistence API ---
+// --- Chat CRUD ---
 app.get("/api/chats", (req, res) => {
-  const chats = db.prepare("SELECT id, title, updated_at FROM chats ORDER BY updated_at DESC").all();
+  const chats = queryAll("SELECT id, title, updated_at FROM chats ORDER BY updated_at DESC");
   res.json({ chats });
 });
 
@@ -149,39 +140,41 @@ app.post("/api/chats", (req, res) => {
   const title = String(req.body?.title || "New Chat").trim().slice(0, 120) || "New Chat";
   const id = randomUUID();
   const createdAt = nowIso();
-  db.prepare("INSERT INTO chats (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)").run(id, title, createdAt, createdAt);
+  run("INSERT INTO chats (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)", [id, title, createdAt, createdAt]);
   res.status(201).json({ id, title, created_at: createdAt, updated_at: createdAt });
 });
 
-app.put("/api/chats/:id", requireChat, (req, res) => {
+app.put("/api/chats/:id", (req, res) => {
+  if (!chatExists(req.params.id)) return res.status(404).json({ error: "Chat not found" });
   const title = String(req.body?.title || "").trim().slice(0, 120);
   if (!title) return res.status(400).json({ error: "title required" });
   const updatedAt = nowIso();
-  db.prepare("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?").run(title, updatedAt, req.params.id);
+  run("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?", [title, updatedAt, req.params.id]);
   res.json({ id: req.params.id, title, updated_at: updatedAt });
 });
 
-app.delete("/api/chats/:id", requireChat, (req, res) => {
-  const remove = db.transaction((id) => {
-    db.prepare("DELETE FROM messages WHERE chat_id = ?").run(id);
-    db.prepare("DELETE FROM versions WHERE chat_id = ?").run(id);
-    db.prepare("DELETE FROM chats WHERE id = ?").run(id);
-  });
-  remove(req.params.id);
+app.delete("/api/chats/:id", (req, res) => {
+  if (!chatExists(req.params.id)) return res.status(404).json({ error: "Chat not found" });
+  run("DELETE FROM messages WHERE chat_id = ?", [req.params.id]);
+  run("DELETE FROM versions WHERE chat_id = ?", [req.params.id]);
+  run("DELETE FROM chats WHERE id = ?", [req.params.id]);
   res.json({ ok: true });
 });
 
-app.get("/api/chats/:id/messages", requireChat, (req, res) => {
-  const messages = db.prepare("SELECT id, role, content, created_at FROM messages WHERE chat_id = ? ORDER BY id ASC").all(req.params.id);
+app.get("/api/chats/:id/messages", (req, res) => {
+  if (!chatExists(req.params.id)) return res.status(404).json({ error: "Chat not found" });
+  const messages = queryAll("SELECT id, role, content, created_at FROM messages WHERE chat_id = ? ORDER BY id ASC", [req.params.id]);
   res.json({ messages });
 });
 
-app.get("/api/chats/:id/versions", requireChat, (req, res) => {
-  const versions = db.prepare("SELECT id, prompt, html, created_at FROM versions WHERE chat_id = ? ORDER BY id ASC").all(req.params.id);
+app.get("/api/chats/:id/versions", (req, res) => {
+  if (!chatExists(req.params.id)) return res.status(404).json({ error: "Chat not found" });
+  const versions = queryAll("SELECT id, prompt, html, created_at FROM versions WHERE chat_id = ? ORDER BY id ASC", [req.params.id]);
   res.json({ versions });
 });
 
-app.post("/api/chats/:id/messages", requireChat, (req, res) => {
+app.post("/api/chats/:id/messages", (req, res) => {
+  if (!chatExists(req.params.id)) return res.status(404).json({ error: "Chat not found" });
   const role = String(req.body?.role || "").trim();
   const content = String(req.body?.content || "").trim();
   if (!role || !content) return res.status(400).json({ error: "role and content required" });
@@ -189,7 +182,8 @@ app.post("/api/chats/:id/messages", requireChat, (req, res) => {
   res.status(201).json(message);
 });
 
-app.post("/api/chats/:id/versions", requireChat, (req, res) => {
+app.post("/api/chats/:id/versions", (req, res) => {
+  if (!chatExists(req.params.id)) return res.status(404).json({ error: "Chat not found" });
   const prompt = String(req.body?.prompt || "").trim();
   const html = String(req.body?.html || "");
   if (!prompt || !html) return res.status(400).json({ error: "prompt and html required" });
@@ -197,71 +191,7 @@ app.post("/api/chats/:id/versions", requireChat, (req, res) => {
   res.status(201).json(version);
 });
 
-// --- Providers API (multiplas base URL + api key, com failover) ---
-app.get("/api/providers", (req, res) => {
-  res.json({ providers: listProvidersSafe() });
-});
-
-app.post("/api/providers", (req, res) => {
-  const name = String(req.body?.name || "").trim().slice(0, 80) || "Provider";
-  const base_url = String(req.body?.base_url || "").trim();
-  const api_key = String(req.body?.api_key || "").trim();
-  const model = String(req.body?.model || "").trim() || BRIDGE_MODEL;
-  if (!base_url || !api_key) return res.status(400).json({ error: "base_url and api_key required" });
-  const id = randomUUID();
-  const maxOrder = db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM providers").get().m;
-  db.prepare(
-    "INSERT INTO providers (id, name, base_url, api_key, model, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)"
-  ).run(id, name, base_url, api_key, model, maxOrder + 1, nowIso());
-  res.status(201).json({ id });
-});
-
-app.put("/api/providers/:id", (req, res) => {
-  const existing = db.prepare("SELECT * FROM providers WHERE id = ?").get(req.params.id);
-  if (!existing) return res.status(404).json({ error: "Provider not found" });
-  const name = req.body?.name !== undefined ? String(req.body.name).trim().slice(0, 80) : existing.name;
-  const base_url = req.body?.base_url !== undefined ? String(req.body.base_url).trim() : existing.base_url;
-  const model = req.body?.model !== undefined ? (String(req.body.model).trim() || BRIDGE_MODEL) : existing.model;
-  const enabled = req.body?.enabled !== undefined ? (req.body.enabled ? 1 : 0) : existing.enabled;
-  const sort_order = req.body?.sort_order !== undefined ? parseInt(req.body.sort_order, 10) : existing.sort_order;
-  // api_key so atualiza se vier preenchida (evita sobrescrever com mascara)
-  const api_key = req.body?.api_key ? String(req.body.api_key).trim() : existing.api_key;
-  db.prepare(
-    "UPDATE providers SET name = ?, base_url = ?, api_key = ?, model = ?, enabled = ?, sort_order = ? WHERE id = ?"
-  ).run(name, base_url, api_key, model, enabled, sort_order, req.params.id);
-  res.json({ ok: true });
-});
-
-app.delete("/api/providers/:id", (req, res) => {
-  db.prepare("DELETE FROM providers WHERE id = ?").run(req.params.id);
-  res.json({ ok: true });
-});
-
-// Testa um provedor especifico (ou um payload ad-hoc) sem gerar design.
-app.post("/api/providers/test", async (req, res) => {
-  let base_url = String(req.body?.base_url || "").trim();
-  let api_key = String(req.body?.api_key || "").trim();
-  let model = String(req.body?.model || "").trim() || BRIDGE_MODEL;
-  if (req.body?.id) {
-    const p = db.prepare("SELECT * FROM providers WHERE id = ?").get(req.body.id);
-    if (!p) return res.status(404).json({ error: "Provider not found" });
-    base_url = p.base_url; api_key = p.api_key; model = p.model || BRIDGE_MODEL;
-  }
-  if (!base_url || !api_key) return res.status(400).json({ error: "base_url and api_key required" });
-  try {
-    const r = await fetch(`${base_url.replace(/\/+$/, "")}/v1/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${api_key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
-    });
-    const text = await r.text();
-    return res.json({ ok: r.ok, status: r.status, body: text.slice(0, 200) });
-  } catch (err) {
-    return res.json({ ok: false, status: 0, body: err.message });
-  }
-});
-
-// --- System prompt for the design generator ---
+// --- System prompt ---
 const SYSTEM_PROMPT = `You are an expert UI designer and frontend developer. You generate beautiful, production-quality HTML interfaces.
 
 DESIGN RULES (always follow):
@@ -289,185 +219,127 @@ ITERATION RULES:
 - Keep all unrelated elements, styles, and structure intact
 - Apply changes surgically, don't rewrite from scratch unless explicitly asked`;
 
-// --- Planning mode system prompt ---
-const PLAN_SYSTEM_PROMPT = `Você é um designer de produto sênior atuando como assistente de PLANEJAMENTO.
-
-No modo PLANEJAMENTO você NÃO gera HTML. Seu objetivo é entender bem o pedido e produzir um plano claro.
-
-COMO AGIR:
-- Se faltar informação essencial para um bom design, faça no máximo 3 a 5 perguntas curtas e de alto valor. Pergunte só o que realmente destrava decisões e sempre sugira um padrão (ex: "Tema escuro? (sugiro sim)").
-- Se já houver contexto suficiente (ou o usuário já respondeu), produza um PLANO bem descrito em markdown: visão geral, telas/seções, componentes, layout, direção de cores e tipografia, e o que será construído.
-- Use a memória da conversa: não repita perguntas já respondidas.
-- Ao final de um plano, diga ao usuário que ele pode pedir "implementar" (ou usar /exec) para você construir.
-
-REGRAS DE SAÍDA:
-- Responda APENAS com texto markdown legível. NUNCA gere HTML, código de página, nem use ferramentas.
-- Seja focado, objetivo e acionável. Responda em português.`;
-
-// Mapeia mensagens persistidas do chat em contexto de conversa para o modelo (memoria).
+// Build memory from chat history
 function buildMemory(chatId, limit = 16) {
   if (!chatId) return [];
-  const rows = db
-    .prepare("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id ASC")
-    .all(chatId);
+  const rows = queryAll("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id ASC", [chatId]);
   const recent = rows.slice(-limit);
-  const mapped = [];
-  for (const m of recent) {
-    if (m.role === "user") {
-      mapped.push({ role: "user", content: m.content });
-    } else if (m.role === "assistant") {
-      // "✓ Design updated" é placeholder de UI; vira nota curta de contexto.
-      const content = m.content === "✓ Design updated" ? "[Gerei uma versão do design conforme pedido acima.]" : m.content;
-      mapped.push({ role: "assistant", content });
-    }
-    // ignora info/error
-  }
-  return mapped;
+  return recent.filter(m => m.role === "user" || m.role === "assistant").map(m => ({
+    role: m.role,
+    content: m.content === "✓ Design updated" ? "[Generated a design version as requested.]" : m.content,
+  }));
 }
 
-// --- Generate endpoint (SSE streaming) — modos plan/exec + memoria ---
+// --- Generate (SSE streaming with failover) ---
 app.post("/api/generate", async (req, res) => {
   const { prompt, currentHtml, chatId } = req.body || {};
-  const mode = req.body?.mode === "plan" ? "plan" : "exec";
   if (!prompt) return res.status(400).json({ error: "prompt required" });
-  if (chatId && !chatExists.get(chatId)) return res.status(404).json({ error: "Chat not found" });
+  if (chatId && !chatExists(chatId)) return res.status(404).json({ error: "Chat not found" });
 
-  // Memoria: pega o historico ANTES de salvar a mensagem atual.
   const memory = buildMemory(chatId);
   if (chatId) saveMessage(chatId, "user", prompt);
 
-  const providers = activeProviders();
-  if (providers.length === 0) {
-    return res.status(503).json({
-      error: "Nenhum provedor configurado. Adicione base URL + API key na aba Provedores (ou configure BRIDGE_URL/BRIDGE_TOKEN).",
-    });
+  if (!BRIDGE_URL || !BRIDGE_TOKEN) {
+    return res.status(503).json({ error: "Bridge not configured. Set BRIDGE_URL and BRIDGE_TOKEN env vars." });
   }
 
-  // Monta as mensagens conforme o modo, sempre incluindo a memoria do chat.
-  const messages = [];
-  if (mode === "plan") {
-    messages.push({ role: "system", content: PLAN_SYSTEM_PROMPT });
-    if (currentHtml) {
-      messages.push({ role: "system", content: "Existe um design atual nesta conversa que pode ser refinado. Leve-o em conta ao planejar." });
-    }
-    messages.push(...memory);
-    messages.push({ role: "user", content: prompt });
-  } else {
-    messages.push({ role: "system", content: SYSTEM_PROMPT });
-    messages.push(...memory);
-    let userMsg = prompt;
-    if (currentHtml) {
-      userMsg = `Here is the current HTML to modify:\n\n\`\`\`html\n${currentHtml}\n\`\`\`\n\nRequest: ${prompt}`;
-    }
-    userMsg += "\n\nResponda APENAS com o c\u00f3digo HTML cru, sem usar nenhuma ferramenta, come\u00e7ando por <!DOCTYPE html>.";
-    messages.push({ role: "user", content: userMsg });
+  // Build messages
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+  messages.push(...memory);
+  let userMsg = prompt;
+  if (currentHtml) {
+    userMsg = `Here is the current HTML to modify:\n\n\`\`\`html\n${currentHtml}\n\`\`\`\n\nRequest: ${prompt}`;
   }
+  userMsg += "\n\nRespond ONLY with raw HTML code starting with <!DOCTYPE html>. No tools, no artifacts.";
+  messages.push({ role: "user", content: userMsg });
 
-  // Set up SSE
+  // SSE setup
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
-  const failures = [];
+  try {
+    const bridgeRes = await fetch(`${BRIDGE_URL}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${BRIDGE_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: BRIDGE_MODEL,
+        messages,
+        stream: true,
+        max_tokens: 16000,
+      }),
+    });
 
-  // Failover: tenta cada provedor habilitado em ordem ate um responder.
-  for (let i = 0; i < providers.length; i++) {
-    const provider = providers[i];
-    let fullContent = "";
-    try {
-      const bridgeRes = await fetch(`${provider.baseUrl}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${provider.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: provider.model,
-          messages,
-          stream: true,
-          max_tokens: mode === "plan" ? 4000 : 16000,
-          tool_choice: "none",
-        }),
-      });
-
-      if (!bridgeRes.ok) {
-        failures.push(`${provider.name} (${bridgeRes.status})`);
-        res.write(`data: ${JSON.stringify({ info: `Provedor \"${provider.name}\" falhou (${bridgeRes.status}), tentando próximo...` })}\n\n`);
-        continue; // proximo provedor
-      }
-
-      // Stream SSE do provedor para o cliente
-      const reader = bridgeRes.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") {
-            continue;
-          }
-          try {
-            const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta?.content || "";
-            if (delta) {
-              fullContent += delta;
-              // Envia apenas o delta incremental (o front acumula). Evita crescimento O(n^2) do SSE.
-              res.write(`data: ${JSON.stringify({ delta, mode })}\n\n`);
-            }
-          } catch {}
-        }
-      }
-
-      // Sucesso se recebeu conteudo (com ou sem [DONE] explicito)
-      if (fullContent) {
-        if (mode === "plan") {
-          // Plano: salva como mensagem do assistente (memoria), NAO cria versao de design.
-          if (chatId) saveMessage(chatId, "assistant", fullContent);
-          res.write(`data: ${JSON.stringify({ done: true, mode: "plan", text: fullContent, provider: provider.name })}\n\n`);
-        } else {
-          if (chatId) {
-            saveMessage(chatId, "assistant", "✓ Design updated");
-            saveVersion(chatId, prompt, fullContent);
-          }
-          res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: fullContent, provider: provider.name })}\n\n`);
-        }
-        res.write("data: [DONE]\n\n");
-        return res.end();
-      }
-      // Sem conteudo: trata como falha e tenta o proximo
-      failures.push(`${provider.name} (vazio)`);
-    } catch (err) {
-      failures.push(`${provider.name} (${err.message})`);
-      res.write(`data: ${JSON.stringify({ info: `Provedor \"${provider.name}\" erro de conexão, tentando próximo...` })}\n\n`);
-      continue;
+    if (!bridgeRes.ok) {
+      const errText = await bridgeRes.text().catch(() => "");
+      res.write(`data: ${JSON.stringify({ error: `Bridge error ${bridgeRes.status}: ${errText.slice(0, 200)}` })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      return res.end();
     }
-  }
 
-  // Todos os provedores falharam
-  res.write(`data: ${JSON.stringify({ error: `Todos os provedores falharam: ${failures.join(", ")}` })}\n\n`);
+    const reader = bridgeRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullContent = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (data === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content || "";
+          if (delta) {
+            fullContent += delta;
+            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+          }
+        } catch {}
+      }
+    }
+
+    // Save and finalize
+    if (fullContent) {
+      if (chatId) {
+        saveMessage(chatId, "assistant", "✓ Design updated");
+        saveVersion(chatId, prompt, fullContent);
+      }
+      res.write(`data: ${JSON.stringify({ done: true, html: fullContent })}\n\n`);
+    } else {
+      res.write(`data: ${JSON.stringify({ error: "No content received from bridge" })}\n\n`);
+    }
+  } catch (err) {
+    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+  }
   res.write("data: [DONE]\n\n");
   res.end();
 });
 
-// --- Serve frontend static files ---
+// --- Static frontend ---
 const frontendPath = join(__dirname, "../../frontend/dist");
 app.use(express.static(frontendPath));
 app.get("*", (req, res) => {
   res.sendFile(join(frontendPath, "index.html"));
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Claude Design App running on port ${PORT}`);
-  console.log(`Bridge: ${BRIDGE_URL || "NOT SET"}`);
-  console.log(`DB: ${dbPath}`);
+// --- Start ---
+initDb().then(() => {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Claude Design App running on port ${PORT}`);
+    console.log(`Bridge: ${BRIDGE_URL || "NOT SET"}`);
+    console.log(`DB: ${dbPath}`);
+  });
+}).catch(err => {
+  console.error("Failed to init DB:", err);
+  process.exit(1);
 });
