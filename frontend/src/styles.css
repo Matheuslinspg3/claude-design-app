@@ -386,3 +386,13 @@ body { background: var(--bg-0); color: var(--text); overflow: hidden; height: 10
   .menu-btn { display: inline-flex; align-items: center; justify-content: center; }
   .app.show-sidebar .sidebar-backdrop { display: block; }
 }
+
+/* --- Cost pill (custo por mensagem) --- */
+.cost-pill {
+  display: flex; flex-direction: column; align-items: flex-end;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 4px 10px; line-height: 1.1;
+  font-size: 12px; font-weight: 600; color: var(--success); cursor: help;
+}
+.cost-pill .cost-sub { font-size: 9px; color: var(--text-muted); font-weight: 400; }
+@media (max-width: 480px) { .cost-pill { display: none; } }

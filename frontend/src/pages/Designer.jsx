@@ -254,6 +254,8 @@ export default function Designer() {
   const [mode, setMode] = useState("exec"); // "plan" | "exec"
   const [mobilePane, setMobilePane] = useState("chat"); // "chat" | "canvas" (mobile)
   const [showSidebar, setShowSidebar] = useState(false); // overlay sidebar (mobile)
+  const [lastCost, setLastCost] = useState(null); // custo da ultima mensagem
+  const [totalBrl, setTotalBrl] = useState(0); // custo acumulado na sessao
   const messagesEnd = useRef(null);
   const abortRef = useRef(null);
   const currentChatRef = useRef(null);
@@ -423,6 +425,7 @@ export default function Designer() {
       let buffer = "";
       let finalHtml = "";
       let planText = "";
+      let lastCost = null;
       let respMode = sendMode;
       let sawDone = false;
       let streamError = null;
@@ -453,6 +456,7 @@ export default function Designer() {
               sawDone = true;
               if (parsed.html) finalHtml = parsed.html;
               if (parsed.text) planText = parsed.text;
+              if (parsed.cost) lastCost = parsed.cost;
             } else if (parsed.delta) {
               // Acumula o delta incremental (backend envia só o trecho novo).
               if (respMode === "plan") { planText += parsed.delta; }
@@ -483,6 +487,7 @@ export default function Designer() {
       if (respMode === "plan") {
         // Modo planejamento: mostra o plano/perguntas como mensagem, sem mexer no canvas.
         setMessages(m => [...m, { role: "plan", content: planText, created_at: new Date().toISOString() }]);
+        if (lastCost) setCostFor(chatId, lastCost);
         setStatus("idle");
         await Promise.all([loadChats(), loadChatState(chatId)]);
         return;
@@ -495,6 +500,7 @@ export default function Designer() {
         setVersions(newVersions);
         setCurrentIdx(newVersions.length - 1);
         setMessages(m => [...m, { role: "assistant", content: "✓ Design updated", created_at: new Date().toISOString() }]);
+        if (lastCost) setCostFor(chatId, lastCost);
         setStatus("idle");
         if (window.innerWidth <= 860) setMobilePane("canvas");
         await Promise.all([loadChats(), loadChatState(chatId)]);
@@ -516,6 +522,11 @@ export default function Designer() {
 
   function handleKeyDown(e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
+  }
+
+  function setCostFor(chatId, cost) {
+    setLastCost(cost);
+    setTotalBrl(t => +(t + (cost?.brl || 0)).toFixed(4));
   }
 
   function copyCode() {
@@ -549,6 +560,12 @@ export default function Designer() {
             <h1>Claude Design</h1>
           </div>
           <div className="chat-header-right">
+            {lastCost && (
+              <div className="cost-pill" title={`Entrada ${lastCost.inputTokens} tok · Saída ${lastCost.outputTokens} tok\n¥${lastCost.cny} × ${lastCost.cnyToBrl} (CNY→BRL) + IOF ${lastCost.iofPct}%\nSessão: R$ ${totalBrl.toFixed(4)}`}>
+                R$ {lastCost.brl.toFixed(4)}
+                <span className="cost-sub">~{lastCost.inputTokens + lastCost.outputTokens} tok</span>
+              </div>
+            )}
             <button className="providers-btn" onClick={() => setShowProviders(true)} title="Provedores (base URLs + API keys)">Provedores</button>
             <div className={`status-pill status-${status}`}>
               <span className="status-dot" /> {status}
