@@ -522,7 +522,7 @@ app.post("/api/generate", async (req, res) => {
           messages,
           stream: true,
           stream_options: { include_usage: true },
-          max_tokens: mode === "plan" ? 4000 : 24000,
+          max_tokens: mode === "plan" ? 4000 : 16000,
           tool_choice: "none",
         }),
       });
