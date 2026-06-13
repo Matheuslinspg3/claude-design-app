@@ -517,7 +517,7 @@ app.post("/api/generate", async (req, res) => {
           messages,
           stream: true,
           stream_options: { include_usage: true },
-          max_tokens: mode === "plan" ? 4000 : 32000,
+          max_tokens: mode === "plan" ? 4000 : 24000,
           tool_choice: "none",
         }),
       });
@@ -585,8 +585,24 @@ app.post("/api/generate", async (req, res) => {
       // Sem conteudo: trata como falha e tenta o proximo
       failures.push(`${provider.name} (vazio)`);
     } catch (err) {
+      // Conexao caiu no meio. Se ja temos HTML utilizavel (provider derruba streams longos),
+      // aproveita o conteudo parcial em vez de perder tudo.
+      if (mode === "exec" && fullContent.includes("</html>")) {
+        if (!usage) {
+          const inChars = messages.reduce((a, m) => a + (m.content?.length || 0), 0);
+          usage = { prompt_tokens: Math.round(inChars / 4), completion_tokens: Math.round(fullContent.length / 4) };
+        }
+        const cost = computeCost(usage, provider.model, pricing, cnyToBrl);
+        if (chatId) {
+          saveMessage(chatId, "assistant", "\u2713 Design updated");
+          saveVersion(chatId, prompt, fullContent);
+        }
+        res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: fullContent, provider: provider.name, cost, salvaged: true })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
       failures.push(`${provider.name} (${err.message})`);
-      res.write(`data: ${JSON.stringify({ info: `Provedor \"${provider.name}\" erro de conexão, tentando próximo...` })}\n\n`);
+      res.write(`data: ${JSON.stringify({ info: `Provedor \"${provider.name}\" caiu no meio, tentando pr\u00f3ximo...` })}\n\n`);
       continue;
     }
   }
