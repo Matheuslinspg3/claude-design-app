@@ -94,6 +94,20 @@ function computeCost(usage, model, pricing, cnyToBrl) {
   };
 }
 
+// Se o stream foi cortado pelo relay antes de fechar o documento, fecha as tags
+// principais para o HTML renderizar no iframe em vez de quebrar.
+function finalizeHtml(html) {
+  if (!html || html.includes("</html>")) return html;
+  let out = html;
+  // fecha uma tag de abertura incompleta no final (ex: "<div clas")
+  const lastLt = out.lastIndexOf("<");
+  const lastGt = out.lastIndexOf(">");
+  if (lastLt > lastGt) out = out.slice(0, lastLt);
+  if (!/<\/body>/i.test(out)) out += "\n</body>";
+  if (!/<\/html>/i.test(out)) out += "\n</html>";
+  return out;
+}
+
 const chatExists = db.prepare("SELECT id FROM chats WHERE id = ?");
 const touchChat = db.prepare("UPDATE chats SET updated_at = ? WHERE id = ?");
 const insertMessage = db.prepare("INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)");
@@ -578,11 +592,12 @@ app.post("/api/generate", async (req, res) => {
           if (chatId) saveMessage(chatId, "assistant", fullContent);
           res.write(`data: ${JSON.stringify({ done: true, mode: "plan", text: fullContent, provider: provider.name, cost })}\n\n`);
         } else {
+          const finalHtml = finalizeHtml(fullContent);
           if (chatId) {
-            saveMessage(chatId, "assistant", "✓ Design updated");
-            saveVersion(chatId, prompt, fullContent);
+            saveMessage(chatId, "assistant", "\u2713 Design updated");
+            saveVersion(chatId, prompt, finalHtml);
           }
-          res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: fullContent, provider: provider.name, cost })}\n\n`);
+          res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: finalHtml, provider: provider.name, cost })}\n\n`);
         }
         res.write("data: [DONE]\n\n");
         return res.end();
@@ -590,19 +605,20 @@ app.post("/api/generate", async (req, res) => {
       // Sem conteudo: trata como falha e tenta o proximo
       failures.push(`${provider.name} (vazio)`);
     } catch (err) {
-      // Conexao caiu no meio. Se ja temos HTML utilizavel (provider derruba streams longos),
-      // aproveita o conteudo parcial em vez de perder tudo.
-      if (mode === "exec" && fullContent.includes("</html>")) {
+      // Conexao caiu no meio. Se ja temos um documento HTML iniciado, fecha e aproveita
+      // (o relay derruba streams longos) em vez de perder tudo.
+      if (mode === "exec" && /<html|<!DOCTYPE/i.test(fullContent) && fullContent.length > 500) {
         if (!usage) {
           const inChars = messages.reduce((a, m) => a + (m.content?.length || 0), 0);
           usage = { prompt_tokens: Math.round(inChars / 4), completion_tokens: Math.round(fullContent.length / 4) };
         }
         const cost = computeCost(usage, provider.model, pricing, cnyToBrl);
+        const finalHtml = finalizeHtml(fullContent);
         if (chatId) {
           saveMessage(chatId, "assistant", "\u2713 Design updated");
-          saveVersion(chatId, prompt, fullContent);
+          saveVersion(chatId, prompt, finalHtml);
         }
-        res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: fullContent, provider: provider.name, cost, salvaged: true })}\n\n`);
+        res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: finalHtml, provider: provider.name, cost, salvaged: true })}\n\n`);
         res.write("data: [DONE]\n\n");
         return res.end();
       }
