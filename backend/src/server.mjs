@@ -25,10 +25,18 @@ db.pragma("journal_mode = WAL");
 db.exec(`
   CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT);
   CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, created_at TEXT);
-  CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, prompt TEXT, html TEXT, created_at TEXT);
+  CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, prompt TEXT, html TEXT, created_at TEXT, cost TEXT);
   CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT, base_url TEXT, api_key TEXT, model TEXT, sort_order INTEGER, enabled INTEGER DEFAULT 1, created_at TEXT);
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 `);
+
+// Migracao: adiciona coluna cost em versions se DB antigo nao tiver.
+try {
+  const cols = db.prepare("PRAGMA table_info(versions)").all();
+  if (!cols.some((c) => c.name === "cost")) {
+    db.exec("ALTER TABLE versions ADD COLUMN cost TEXT");
+  }
+} catch {}
 
 // --- Pricing / custo por mensagem ---
 // Preços em CNY (¥) por 1 milhão de tokens. Editáveis via /api/pricing.
@@ -111,7 +119,7 @@ function finalizeHtml(html) {
 const chatExists = db.prepare("SELECT id FROM chats WHERE id = ?");
 const touchChat = db.prepare("UPDATE chats SET updated_at = ? WHERE id = ?");
 const insertMessage = db.prepare("INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)");
-const insertVersion = db.prepare("INSERT INTO versions (chat_id, prompt, html, created_at) VALUES (?, ?, ?, ?)");
+const insertVersion = db.prepare("INSERT INTO versions (chat_id, prompt, html, created_at, cost) VALUES (?, ?, ?, ?, ?)");
 
 function nowIso() {
   return new Date().toISOString();
@@ -176,12 +184,13 @@ function saveMessage(chatId, role, content) {
   return { id: info.lastInsertRowid, chat_id: chatId, role, content, created_at: createdAt };
 }
 
-function saveVersion(chatId, prompt, html) {
+function saveVersion(chatId, prompt, html, cost = null) {
   if (!chatId || !chatExists.get(chatId)) return null;
   const createdAt = nowIso();
-  const info = insertVersion.run(chatId, prompt, html, createdAt);
+  const costJson = cost ? JSON.stringify(cost) : null;
+  const info = insertVersion.run(chatId, prompt, html, createdAt, costJson);
   touchChat.run(createdAt, chatId);
-  return { id: info.lastInsertRowid, chat_id: chatId, prompt, html, created_at: createdAt };
+  return { id: info.lastInsertRowid, chat_id: chatId, prompt, html, created_at: createdAt, cost };
 }
 
 app.use(express.json({ limit: "2mb" }));
@@ -256,7 +265,8 @@ app.get("/api/chats/:id/messages", requireChat, (req, res) => {
 });
 
 app.get("/api/chats/:id/versions", requireChat, (req, res) => {
-  const versions = db.prepare("SELECT id, prompt, html, created_at FROM versions WHERE chat_id = ? ORDER BY id ASC").all(req.params.id);
+  const rows = db.prepare("SELECT id, prompt, html, created_at, cost FROM versions WHERE chat_id = ? ORDER BY id ASC").all(req.params.id);
+  const versions = rows.map((v) => ({ ...v, cost: v.cost ? JSON.parse(v.cost) : null }));
   res.json({ versions });
 });
 
@@ -595,7 +605,7 @@ app.post("/api/generate", async (req, res) => {
           const finalHtml = finalizeHtml(fullContent);
           if (chatId) {
             saveMessage(chatId, "assistant", "\u2713 Design updated");
-            saveVersion(chatId, prompt, finalHtml);
+            saveVersion(chatId, prompt, finalHtml, cost);
           }
           res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: finalHtml, provider: provider.name, cost })}\n\n`);
         }
@@ -616,7 +626,7 @@ app.post("/api/generate", async (req, res) => {
         const finalHtml = finalizeHtml(fullContent);
         if (chatId) {
           saveMessage(chatId, "assistant", "\u2713 Design updated");
-          saveVersion(chatId, prompt, finalHtml);
+          saveVersion(chatId, prompt, finalHtml, cost);
         }
         res.write(`data: ${JSON.stringify({ done: true, mode: "exec", html: finalHtml, provider: provider.name, cost, salvaged: true })}\n\n`);
         res.write("data: [DONE]\n\n");

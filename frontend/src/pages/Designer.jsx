@@ -397,6 +397,12 @@ export default function Designer() {
   const generating = status === "generating";
   const currentHtml = currentIdx >= 0 ? versions[currentIdx]?.html : "";
 
+  // Pilula de custo reflete a versao selecionada no historico.
+  useEffect(() => {
+    const v = currentIdx >= 0 ? versions[currentIdx] : null;
+    if (v && v.cost) setLastCost(v.cost);
+  }, [currentIdx, versions]);
+
   const loadChats = useCallback(async () => {
     const data = await api("/api/chats");
     setChatList(data.chats || []);
@@ -418,6 +424,10 @@ export default function Designer() {
     setMessages(messageData.messages || []);
     setVersions(loadedVersions);
     setCurrentIdx(loadedVersions.length - 1);
+    // Restaura o custo da ultima versao salva (persistente entre recargas).
+    const lastWithCost = [...loadedVersions].reverse().find(v => v.cost);
+    setLastCost(lastWithCost ? lastWithCost.cost : null);
+    setTotalBrl(loadedVersions.reduce((a, v) => a + (v.cost?.brl || 0), 0));
   }, []);
 
   const bootstrap = useCallback(async () => {
@@ -841,7 +851,7 @@ export default function Designer() {
                 onClick={() => setCurrentIdx(i)}>
                 <div className="v-idx">v{i + 1}</div>
                 <div className="v-prompt">{v.prompt}</div>
-                <div className="v-time">{formatTime(v.created_at || v.createdAt)}</div>
+                <div className="v-time">{formatTime(v.created_at || v.createdAt)}{v.cost ? ` · R$ ${v.cost.brl.toFixed(4)}` : ""}</div>
               </div>
             ))}
           </div>
