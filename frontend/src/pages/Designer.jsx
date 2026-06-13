@@ -70,6 +70,24 @@ function renderMarkdown(src) {
   return out;
 }
 
+// Extrai bloco ```questions {json} de uma resposta de plano. Retorna {intro, questions[]} ou null.
+function parseQuestions(text) {
+  if (!text) return null;
+  const m = text.match(/```questions\s*([\s\S]*?)```/);
+  let raw = m ? m[1] : null;
+  // fallback: resposta pode vir como JSON puro
+  if (!raw) {
+    const t = text.trim();
+    if (t.startsWith("{") && t.includes("\"questions\"")) raw = t;
+  }
+  if (!raw) return null;
+  try {
+    const obj = JSON.parse(raw.trim());
+    if (Array.isArray(obj.questions) && obj.questions.length) return obj;
+  } catch {}
+  return null;
+}
+
 function Sidebar({ chats, currentChatId, onNewChat, onSelectChat, onRenameChat, onDeleteChat }) {
   const [editingId, setEditingId] = useState(null);
   const [draftTitle, setDraftTitle] = useState("");
@@ -241,6 +259,77 @@ function ProvidersModal({ onClose }) {
   );
 }
 
+// Wizard de perguntas guiadas: uma pergunta por vez, com progresso e opção "outro".
+function Wizard({ data, onComplete, disabled }) {
+  const questions = data.questions || [];
+  const [step, setStep] = useState(0);
+  const [answers, setAnswers] = useState({});
+  const [otherText, setOtherText] = useState("");
+  const [done, setDone] = useState(false);
+
+  const q = questions[step];
+  const total = questions.length;
+  const progress = Math.round(((done ? total : step) / total) * 100);
+
+  function choose(value) {
+    const next = { ...answers, [q.id || step]: { label: q.label, value } };
+    setAnswers(next);
+    setOtherText("");
+    if (step + 1 < total) {
+      setStep(step + 1);
+    } else {
+      setDone(true);
+      onComplete(next);
+    }
+  }
+
+  if (done) {
+    return (
+      <div className="wizard wizard-done">
+        <div className="wizard-progress"><div className="wizard-bar" style={{ width: "100%" }} /></div>
+        <div className="wizard-summary">
+          {Object.values(answers).map((a, i) => (
+            <div key={i} className="wizard-ans"><span>{a.label}</span><strong>{a.value}</strong></div>
+          ))}
+        </div>
+        <div className="wizard-foot">Montando o plano com base nas suas respostas...</div>
+      </div>
+    );
+  }
+
+  if (!q) return null;
+
+  return (
+    <div className="wizard">
+      {data.intro && step === 0 && <div className="wizard-intro">{data.intro}</div>}
+      <div className="wizard-progress"><div className="wizard-bar" style={{ width: `${progress}%` }} /></div>
+      <div className="wizard-step-label">Pergunta {step + 1} de {total}</div>
+      <div className="wizard-q">{q.label}</div>
+      <div className="wizard-options">
+        {(q.options || []).map((opt, i) => (
+          <button key={i} type="button" disabled={disabled}
+            className={`wizard-opt ${opt === q.suggestion ? "suggested" : ""}`}
+            onClick={() => choose(opt)}>
+            {opt}{opt === q.suggestion && <span className="wizard-sug-tag">sugerido</span>}
+          </button>
+        ))}
+      </div>
+      {q.allowOther && (
+        <form className="wizard-other" onSubmit={(e) => { e.preventDefault(); if (otherText.trim()) choose(otherText.trim()); }}>
+          <input placeholder="Outro: digite sua resposta..." value={otherText}
+            onChange={(e) => setOtherText(e.target.value)} disabled={disabled} />
+          <button type="submit" disabled={disabled || !otherText.trim()}>OK</button>
+        </form>
+      )}
+      {q.suggestion && (
+        <button type="button" className="wizard-skip" disabled={disabled} onClick={() => choose(q.suggestion)}>
+          Usar sugestão: {q.suggestion}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function Designer() {
   const [chatList, setChatList] = useState([]);
   const [currentChatId, setCurrentChatId] = useState(null);
@@ -384,13 +473,26 @@ export default function Designer() {
     else if (/^\/exec\b/i.test(raw)) { sendMode = "exec"; raw = raw.replace(/^\/exec\b\s*/i, ""); }
     const prompt = raw.trim();
     if (!prompt) return;
+    setInput("");
+    await runGenerate(prompt, sendMode, { userBubble: prompt });
+  }
 
+  // Consolida respostas do wizard e pede o plano completo.
+  async function submitWizard(answers) {
+    const lines = Object.values(answers).map(a => `- ${a.label} ${a.value}`).join("\n");
+    const consolidated = `Minhas respostas:\n${lines}\n\nCom base nisso, monte o plano completo.`;
+    await runGenerate(consolidated, "plan", { userBubble: "✓ Respostas enviadas" });
+  }
+
+  async function runGenerate(prompt, sendMode, opts = {}) {
+    if (generating) return;
     let chatId = currentChatId;
     if (!chatId) chatId = await createChat(prompt.slice(0, 48));
 
-    setInput("");
     setStatus("generating");
-    setMessages(m => [...m, { role: "user", content: prompt, created_at: new Date().toISOString() }]);
+    if (opts.userBubble) {
+      setMessages(m => [...m, { role: "user", content: opts.userBubble, created_at: new Date().toISOString() }]);
+    }
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -485,8 +587,13 @@ export default function Designer() {
       }
 
       if (respMode === "plan") {
-        // Modo planejamento: mostra o plano/perguntas como mensagem, sem mexer no canvas.
-        setMessages(m => [...m, { role: "plan", content: planText, created_at: new Date().toISOString() }]);
+        // Detecta bloco de perguntas guiadas (wizard) vs plano em markdown.
+        const q = parseQuestions(planText);
+        if (q) {
+          setMessages(m => [...m, { role: "wizard", questions: q, created_at: new Date().toISOString() }]);
+        } else {
+          setMessages(m => [...m, { role: "plan", content: planText, created_at: new Date().toISOString() }]);
+        }
         if (lastCost) setCostFor(chatId, lastCost);
         setStatus("idle");
         await Promise.all([loadChats(), loadChatState(chatId)]);
@@ -574,7 +681,29 @@ export default function Designer() {
         </div>
         <div className="chat-messages">
           {messages.map((m, i) => {
+            const isLast = i === messages.length - 1;
+            // Mensagem wizard ao vivo (gerada nesta sessão)
+            if (m.role === "wizard") {
+              return (
+                <div key={m.id || i} className="msg msg-plan msg-wizard">
+                  <div className="msg-plan-tag">Perguntas</div>
+                  <Wizard data={m.questions} disabled={generating || !isLast}
+                    onComplete={(ans) => submitWizard(ans)} />
+                </div>
+              );
+            }
+            // Plano/assistente vindo do DB: pode conter bloco de perguntas
             if (m.role === "plan" || (m.role === "assistant" && isPlanLike(m.content))) {
+              const q = parseQuestions(m.content);
+              if (q) {
+                return (
+                  <div key={m.id || i} className="msg msg-plan msg-wizard">
+                    <div className="msg-plan-tag">Perguntas</div>
+                    <Wizard data={q} disabled={generating || !isLast}
+                      onComplete={(ans) => submitWizard(ans)} />
+                  </div>
+                );
+              }
               return (
                 <div key={m.id || i} className="msg msg-plan">
                   <div className="msg-plan-tag">Plano</div>

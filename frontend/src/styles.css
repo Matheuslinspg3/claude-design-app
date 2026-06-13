@@ -396,3 +396,48 @@ body { background: var(--bg-0); color: var(--text); overflow: hidden; height: 10
 }
 .cost-pill .cost-sub { font-size: 9px; color: var(--text-muted); font-weight: 400; }
 @media (max-width: 480px) { .cost-pill { display: none; } }
+
+/* --- Wizard de perguntas guiadas --- */
+.msg-wizard { max-width: 100%; width: 100%; }
+.wizard { display: flex; flex-direction: column; gap: 12px; }
+.wizard-intro { font-size: 13px; color: var(--text-dim); }
+.wizard-progress { height: 6px; background: var(--bg-0); border-radius: 999px; overflow: hidden; }
+.wizard-bar { height: 100%; background: var(--accent); border-radius: 999px; transition: width 300ms ease; }
+.wizard-step-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.wizard-q { font-size: 15px; font-weight: 600; color: var(--text); }
+.wizard-options { display: flex; flex-direction: column; gap: 8px; }
+.wizard-opt {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  text-align: left; padding: 12px 14px; background: var(--bg-3);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font-size: 14px; font-family: inherit; cursor: pointer;
+  transition: all var(--transition);
+}
+.wizard-opt:hover:not(:disabled) { border-color: var(--accent); background: var(--bg-2); transform: translateX(2px); }
+.wizard-opt:disabled { opacity: 0.5; cursor: default; }
+.wizard-opt.suggested { border-color: var(--accent); }
+.wizard-sug-tag {
+  font-size: 10px; background: var(--accent); color: white;
+  padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap;
+}
+.wizard-other { display: flex; gap: 8px; }
+.wizard-other input {
+  flex: 1; background: var(--bg-0); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text); padding: 10px 12px; font-size: 13px; font-family: inherit;
+}
+.wizard-other input:focus { outline: none; border-color: var(--accent); }
+.wizard-other button {
+  padding: 0 16px; background: var(--accent); color: white; border: none;
+  border-radius: var(--radius-sm); font-weight: 600; cursor: pointer; font-size: 13px;
+}
+.wizard-other button:disabled { opacity: 0.5; }
+.wizard-skip {
+  background: none; border: none; color: var(--text-muted); font-size: 12px;
+  cursor: pointer; text-align: left; padding: 2px; text-decoration: underline;
+}
+.wizard-skip:hover:not(:disabled) { color: var(--accent); }
+.wizard-done .wizard-summary { display: flex; flex-direction: column; gap: 6px; }
+.wizard-ans { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.wizard-ans span { color: var(--text-muted); }
+.wizard-ans strong { color: var(--text); }
+.wizard-foot { font-size: 12px; color: var(--accent); font-style: italic; }
