@@ -88,6 +88,51 @@ function parseQuestions(text) {
   return null;
 }
 
+const PLAN_FINAL_SUGGESTIONS = [
+  { label: "Implementar agora", mode: "exec", tone: "primary", prompt: "Implemente o plano acima como um HTML completo, polido, responsivo e navegável." },
+  { label: "Refinar direção visual", mode: "plan", prompt: "Refine o plano acima com uma direção visual mais forte: paleta, tipografia, ritmo, componentes e microinterações." },
+  { label: "Adicionar estados importantes", mode: "plan", prompt: "Complete o plano com estados vazios, loading, erro, mobile e acessibilidade antes de implementar." },
+];
+
+const DESIGN_FINAL_SUGGESTIONS = [
+  { label: "Melhorar mobile", mode: "exec", prompt: "Melhore a experiência mobile do design atual, mantendo a identidade visual e todos os fluxos funcionando." },
+  { label: "Criar variação visual", mode: "exec", prompt: "Crie uma variação visual mais ousada do design atual, preservando conteúdo, navegação e funcionalidades." },
+  { label: "Refinar copy", mode: "exec", prompt: "Refine a copy do design atual com textos mais claros, reais e persuasivos, mantendo o layout consistente." },
+  { label: "Adicionar estado vazio", mode: "exec", prompt: "Adicione estados vazios, loading e erro bem desenhados onde fizer sentido no design atual." },
+  { label: "Versão mais premium", mode: "exec", prompt: "Eleve o design atual para uma versão mais premium, com hierarquia, espaçamento, sombras e microinterações mais refinadas." },
+];
+
+function finalSuggestionsFor(message) {
+  if (!message) return [];
+  if (message.role === "assistant" && message.content === "\u2713 Design updated") return DESIGN_FINAL_SUGGESTIONS;
+  if (message.role === "plan") return PLAN_FINAL_SUGGESTIONS;
+  if (message.role === "assistant" && isPlanLike(message.content)) return PLAN_FINAL_SUGGESTIONS;
+  return [];
+}
+
+function FinalSuggestions({ suggestions, disabled, onPick }) {
+  if (!suggestions.length) return null;
+  return (
+    <div className="final-suggestions" aria-label="Sugestões finais">
+      <div className="final-suggestions-title">Sugestões finais</div>
+      <div className="final-suggestions-list">
+        {suggestions.map((s) => (
+          <button
+            key={s.label}
+            type="button"
+            className={`final-suggestion-chip ${s.tone === "primary" ? "primary" : ""}`}
+            disabled={disabled}
+            onClick={() => onPick(s)}
+            title={s.prompt}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function Sidebar({ chats, currentChatId, onNewChat, onSelectChat, onRenameChat, onDeleteChat }) {
   const [editingId, setEditingId] = useState(null);
   const [draftTitle, setDraftTitle] = useState("");
@@ -484,6 +529,12 @@ export default function Designer() {
     await runGenerate(consolidated, "plan", { userBubble: "✓ Respostas enviadas" });
   }
 
+  async function handleFinalSuggestion(suggestion) {
+    if (generating || !suggestion) return;
+    setMode(suggestion.mode);
+    await runGenerate(suggestion.prompt, suggestion.mode, { userBubble: suggestion.label });
+  }
+
   async function runGenerate(prompt, sendMode, opts = {}) {
     if (generating) return;
     let chatId = currentChatId;
@@ -705,9 +756,29 @@ export default function Designer() {
                 );
               }
               return (
-                <div key={m.id || i} className="msg msg-plan">
-                  <div className="msg-plan-tag">Plano</div>
-                  <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
+                <div key={m.id || i} className="msg-stack">
+                  <div className="msg msg-plan">
+                    <div className="msg-plan-tag">Plano</div>
+                    <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
+                  </div>
+                  <FinalSuggestions
+                    suggestions={finalSuggestionsFor(m)}
+                    disabled={generating}
+                    onPick={handleFinalSuggestion}
+                  />
+                </div>
+              );
+            }
+            const suggestions = finalSuggestionsFor(m);
+            if (suggestions.length) {
+              return (
+                <div key={m.id || i} className="msg-stack">
+                  <div className={`msg msg-${m.role}`}>{m.content}</div>
+                  <FinalSuggestions
+                    suggestions={suggestions}
+                    disabled={generating}
+                    onPick={handleFinalSuggestion}
+                  />
                 </div>
               );
             }
